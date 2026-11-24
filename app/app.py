@@ -30,6 +30,7 @@ if str(AKAR) not in sys.path:
 from src import config as cfg                      # noqa: E402
 from src import evaluasi, knowledge, ml_model, pipeline, sensitivity  # noqa: E402
 from src import input_pemohon as inp               # noqa: E402
+from src import tampilan                           # noqa: E402
 from src.mcdm import ahp, ranking                  # noqa: E402
 
 SUMBER_GABUNG = "40 pemohon contoh + pemohon input"
@@ -43,13 +44,14 @@ def rupiah(nilai: float, singkat: bool = False) -> str:
     berbeda antartab karena sebagian memakai format bawaan Python.
     """
     if singkat and abs(nilai) >= 1_000_000:
-        return f"Rp{nilai / 1_000_000:,.1f} jt".replace(",", ".")
+        # Format Indonesia: titik pemisah ribuan, koma desimal.
+        angka = f"{nilai / 1_000_000:,.1f}".replace(",", "_").replace(".", ",")
+        return f"Rp{angka.replace('_', '.')} jt"
     return f"Rp{nilai:,.0f}".replace(",", ".")
 
 
 st.set_page_config(
     page_title="SPK Prioritisasi Kredit Mikro",
-    page_icon="📊",
     layout="wide",
 )
 
@@ -134,6 +136,7 @@ def hitung_ulang(konteks: dict, bobot: np.ndarray, metode: str) -> pd.DataFrame:
 def gambar_sidebar(bobot_ahp: np.ndarray) -> dict:
     st.sidebar.header("Parameter Keputusan")
 
+    st.sidebar.markdown("##### Pemohon")
     n_input = len(st.session_state.get("pemohon_baru", []))
     sumber = st.sidebar.radio(
         "Pemohon yang diperingkat", [SUMBER_GABUNG, SUMBER_INPUT],
@@ -145,6 +148,7 @@ def gambar_sidebar(bobot_ahp: np.ndarray) -> dict:
     # satuan diubah ke Rupiah, sehingga nilai bawaan Rp60 juta melampaui
     # batas atas Rp200 ribu dan aplikasi gagal dijalankan. Menurunkan batas
     # dari sumber yang sama membuat kesalahan semacam itu tidak bisa terulang.
+    st.sidebar.markdown("##### Dana dan batas")
     plafon_awal = int(cfg.PLAFON_PERIODE)
     langkah = max(1, 10 ** (len(str(plafon_awal)) - 3))   # 2 digit pertama
     plafon = st.sidebar.number_input(
@@ -160,10 +164,10 @@ def gambar_sidebar(bobot_ahp: np.ndarray) -> dict:
         "Batas keras PD", 0.30, 0.95, float(cfg.PD_HARD_LIMIT), 0.01,
         help="Pemohon dengan PD di atas nilai ini ditolak berapa pun peringkatnya.",
     )
+    st.sidebar.markdown("##### Metode")
     metode = st.sidebar.selectbox("Metode pemeringkatan", ["TOPSIS", "SAW", "VIKOR"])
 
-    st.sidebar.divider()
-    st.sidebar.subheader("Bobot Kriteria")
+    st.sidebar.markdown("##### Bobot kriteria")
 
     if st.sidebar.button("Kembalikan ke bobot AHP", use_container_width=True):
         for i, kode in enumerate(cfg.CRITERIA_CODES):
@@ -206,6 +210,7 @@ def gambar_sidebar(bobot_ahp: np.ndarray) -> dict:
     # Perbaikan temuan HE-08 (keparahan 4): mode evaluasi dinyatakan eksplisit.
     # st.toggle baru tersedia sejak Streamlit 1.26. checkbox dipakai sebagai
     # cadangan agar aplikasi tetap berjalan pada pemasangan yang lebih lama.
+    st.sidebar.markdown("##### Mode")
     sakelar = getattr(st.sidebar, "toggle", st.sidebar.checkbox)
     mode_evaluasi = sakelar(
         "Mode evaluasi", value=True,
@@ -223,26 +228,24 @@ def gambar_sidebar(bobot_ahp: np.ndarray) -> dict:
 def tab_keputusan(df_keputusan: pd.DataFrame, par: dict) -> None:
     disetujui = df_keputusan[df_keputusan["status_keputusan"] == "DISETUJUI"]
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Disetujui", len(disetujui))
-    k2.metric(
-        "Dana tersalur",
-        rupiah(df_keputusan["nominal_disetujui"].sum(), singkat=True),
-        f"{df_keputusan['nominal_disetujui'].sum() / par['plafon'] * 100:.1f}% plafon",
-    )
-    k3.metric(
-        "PD rata-rata penerima",
-        f"{disetujui['pd_model'].mean():.3f}" if len(disetujui) else "-",
-        f"{disetujui['pd_model'].mean() - df_keputusan['pd_model'].mean():+.3f} vs semua"
-        if len(disetujui) else None,
-        delta_color="inverse",
-    )
-    k4.metric(
-        "IKS rata-rata penerima",
-        f"{disetujui['iks_skor'].mean():.2f}" if len(disetujui) else "-",
-        f"{disetujui['iks_skor'].mean() - df_keputusan['iks_skor'].mean():+.2f} vs semua"
-        if len(disetujui) else None,
-    )
+    ada = len(disetujui) > 0
+    tersalur = df_keputusan["nominal_disetujui"].sum()
+    selisih_pd = disetujui["pd_model"].mean() - df_keputusan["pd_model"].mean() if ada else 0.0
+    selisih_iks = disetujui["iks_skor"].mean() - df_keputusan["iks_skor"].mean() if ada else 0.0
+    butir = [
+        {"label": "Disetujui", "nilai": len(disetujui),
+         "catatan": f"dari {len(df_keputusan)} pemohon"},
+        {"label": "Dana tersalur", "nilai": rupiah(tersalur, singkat=True),
+         "catatan": f"{tersalur / par['plafon'] * 100:.1f}% plafon".replace(".", ",")},
+        {"label": "PD rata-rata penerima",
+         "nilai": f"{disetujui['pd_model'].mean():.3f}" if ada else "–",
+         "catatan": f"{selisih_pd:+.3f} vs semua pemohon" if ada else None,
+         "nada": "baik" if selisih_pd <= 0 else "buruk"},
+        {"label": "IKS rata-rata penerima",
+         "nilai": f"{disetujui['iks_skor'].mean():.2f}" if ada else "–",
+         "catatan": f"{selisih_iks:+.2f} vs semua pemohon" if ada else None,
+         "nada": "baik" if selisih_iks >= 0 else "buruk"},
+    ]
     # Perbaikan temuan HE-08 (keparahan 4). Kolom target_macet hanya tersedia
     # karena berkas periode diambil dari data uji berlabel. Pada penyaluran
     # nyata metrik ini MUSTAHIL ada sebelum masa angsuran berjalan, sehingga
@@ -253,27 +256,36 @@ def tab_keputusan(df_keputusan: pd.DataFrame, par: dict) -> None:
     disetujui_label = disetujui[disetujui["target_macet"].notna()]
     semua_label = df_keputusan[df_keputusan["target_macet"].notna()]
     if par.get("mode_evaluasi") and len(disetujui_label):
-        k5.metric(
-            "Macet aktual  [EVALUASI]",
-            f"{disetujui_label['target_macet'].mean():.1%}",
-            f"{disetujui_label['target_macet'].mean() - semua_label['target_macet'].mean():+.1%}",
-            delta_color="inverse",
-            help="Hanya tersedia pada data uji berlabel. Pada penyaluran "
-                 "nyata angka ini belum ada saat keputusan diambil. Pemohon "
-                 f"input tidak ikut dihitung ({len(disetujui) - len(disetujui_label)} "
-                 "penerima tanpa label).",
-        )
-    elif len(disetujui):
-        k5.metric("Macet aktual", "—",
-                  help="Tidak tersedia di luar mode evaluasi atau tanpa pemohon berlabel.")
+        macet = disetujui_label["target_macet"].mean()
+        selisih_macet = macet - semua_label["target_macet"].mean()
+        butir.append({
+            "label": "Macet aktual", "evaluasi": True,
+            "nilai": f"{macet:.1%}".replace(".", ","),
+            "catatan": f"{selisih_macet:+.1%} vs semua pemohon".replace(".", ","),
+            "nada": "baik" if selisih_macet <= 0 else "buruk",
+            "bantuan": "Hanya tersedia pada data uji berlabel. Pada penyaluran "
+                       "nyata angka ini belum ada saat keputusan diambil. Pemohon "
+                       f"input tidak ikut dihitung ({len(disetujui) - len(disetujui_label)} "
+                       "penerima tanpa label).",
+        })
+    elif ada:
+        butir.append({
+            "label": "Macet aktual", "nilai": "–",
+            "catatan": "di luar mode evaluasi",
+            "bantuan": "Tidak tersedia di luar mode evaluasi atau tanpa pemohon berlabel.",
+        })
+    tampilan.pita(st, butir)
 
-    st.divider()
-
+    tampilan.bagian(
+        st, "Daftar keputusan", "Peringkat dan status pemohon",
+        "Diurutkan dari skor tertinggi. Dana dibagikan menurut urutan ini "
+        "sampai plafon habis.",
+    )
     semua_status = ["DISETUJUI", "DITUNDA", "DITOLAK", "PERLU VERIFIKASI"]
     saring = st.multiselect("Tampilkan status", semua_status, default=semua_status)
     tampil = df_keputusan[df_keputusan["status_keputusan"].isin(saring)]
 
-    st.dataframe(
+    tabel = (
         tampil[[
             "rank_TOPSIS", "id_pemohon", "sumber", "skor", "iks_skor", "kapasitas_angsur",
             "skor_riwayat", "skor_produktif", "pd_model", "nilai_pengajuan_rp",
@@ -285,7 +297,10 @@ def tab_keputusan(df_keputusan: pd.DataFrame, par: dict) -> None:
             "skor_riwayat": "C3 Riwayat", "skor_produktif": "C4 Produktif",
             "pd_model": "C5 PD", "nilai_pengajuan_rp": "C6 Nilai (Rp)",
             "status_keputusan": "Status", "alasan": "Alasan",
-        }).sort_values("Peringkat"),
+        }).sort_values("Peringkat")
+    )
+    st.dataframe(
+        tampilan.warnai_status(tabel),
         use_container_width=True, hide_index=True, height=430,
         column_config={
             "Skor": st.column_config.NumberColumn(format="%.4f"),
@@ -296,7 +311,11 @@ def tab_keputusan(df_keputusan: pd.DataFrame, par: dict) -> None:
         },
     )
 
-    st.subheader("Rincian satu pemohon")
+    tampilan.bagian(
+        st, "Rincian", "Mengapa pemohon ini di peringkat tersebut",
+        "Pilih satu pemohon untuk melihat nilai tiap kriteria, alasan "
+        "keputusan, dan beban angsurannya.",
+    )
     daftar_id = tampil.sort_values("rank_TOPSIS")["id_pemohon"].tolist()
     if not daftar_id:
         st.info("Tidak ada pemohon dengan status yang dipilih.")
@@ -311,15 +330,45 @@ def tab_keputusan(df_keputusan: pd.DataFrame, par: dict) -> None:
     kiri, kanan = st.columns([1, 1])
     with kiri:
         st.markdown(f"**Penjelasan peringkat**\n\n{baris['penjelasan']}")
-        st.markdown(f"**Keputusan:** `{baris['status_keputusan']}` — {baris['alasan']}")
+        st.markdown(
+            f"**Keputusan** {tampilan.lencana(baris['status_keputusan'])} "
+            f"{baris['alasan']}",
+            unsafe_allow_html=True,
+        )
         tampilkan_beban(baris)
         if baris.get("sumber") == "Input":
             tampilkan_verifikasi(baris)
     with kanan:
+        rapor_pemohon(baris, df_keputusan)
         st.markdown(f"**Indikator deprivasi yang terpenuhi (IKS {int(baris['iks_skor'])}/{cfg.IKS_MAX})**")
         alasan_iks = knowledge.jelaskan_iks(baris)
         st.markdown("\n".join(f"- {a}" for a in alasan_iks) if alasan_iks
                     else "- Tidak ada indikator deprivasi terpenuhi")
+
+
+def rapor_pemohon(r: pd.Series, df: pd.DataFrame) -> None:
+    """Nilai C1-C6 satu pemohon dalam bentuk lembar rapor."""
+    nilai_maks = float(df["nilai_pengajuan_rp"].max()) or 1.0
+    tampilan.rapor(st, [
+        {"kode": "C1", "nama": cfg.CRITERIA_NAMES["C1"],
+         "nilai": f"{int(r['iks_skor'])} / {cfg.IKS_MAX}",
+         "porsi": r["iks_skor"] / cfg.IKS_MAX, "benefit": True},
+        {"kode": "C2", "nama": cfg.CRITERIA_NAMES["C2"],
+         "nilai": f"{r['kapasitas_angsur']:.0f} / 100",
+         "porsi": r["kapasitas_angsur"] / 100, "benefit": True},
+        {"kode": "C3", "nama": cfg.CRITERIA_NAMES["C3"],
+         "nilai": f"{int(r['skor_riwayat'])} / 4",
+         "porsi": r["skor_riwayat"] / 4, "benefit": True},
+        {"kode": "C4", "nama": cfg.CRITERIA_NAMES["C4"],
+         "nilai": f"{int(r['skor_produktif'])} / 4",
+         "porsi": r["skor_produktif"] / 4, "benefit": True},
+        {"kode": "C5", "nama": cfg.CRITERIA_NAMES["C5"],
+         "nilai": f"{r['pd_model']:.3f}",
+         "porsi": r["pd_model"], "benefit": False},
+        {"kode": "C6", "nama": cfg.CRITERIA_NAMES["C6"],
+         "nilai": rupiah(r["nilai_pengajuan_rp"], singkat=True),
+         "porsi": r["nilai_pengajuan_rp"] / nilai_maks, "benefit": False},
+    ])
 
 
 def tampilkan_beban(baris: pd.Series) -> None:
@@ -389,22 +438,19 @@ def tampilkan_hasil_terakhir(df_keputusan: pd.DataFrame | None) -> None:
 
     with st.container(border=True):
         st.markdown(f"#### Hasil penilaian {id_akhir}")
-        pesan = (f"Peringkat {int(r['rank_TOPSIS'])} dari {len(df_keputusan)} · "
-                 f"status **{status}** — {r['alasan']}")
-        {"DISETUJUI": st.success, "DITUNDA": st.info,
-         "DITOLAK": st.error}.get(status, st.warning)(pesan)
+        st.markdown(
+            f"{tampilan.lencana(status)} &nbsp;Peringkat "
+            f"**{int(r['rank_TOPSIS'])}** dari {len(df_keputusan)} · {r['alasan']}",
+            unsafe_allow_html=True,
+        )
 
         lebih_aman = (df_keputusan["pd_model"] < r["pd_model"]).mean()
-        a, b, c = st.columns(3)
-        a.metric("C1 Kebutuhan Sosial", f"{int(r['iks_skor'])}/{cfg.IKS_MAX}")
-        b.metric("C2 Kapasitas Angsur", f"{r['kapasitas_angsur']:.0f}/100")
-        c.metric("C3 Riwayat Kredit", f"{int(r['skor_riwayat'])}/4")
-        a, b, c = st.columns(3)
-        a.metric("C4 Dampak Produktif", f"{int(r['skor_produktif'])}/4")
-        b.metric("C5 Risiko Gagal Bayar", f"{r['pd_model']:.3f}",
-                 help=f"Lebih berisiko daripada {lebih_aman:.0%} pemohon lain. "
-                      "Dibaca sebagai peringkat risiko relatif, bukan peluang pasti.")
-        c.metric("C6 Nilai Pengajuan", rupiah(r["nilai_pengajuan_rp"], singkat=True))
+        rapor_pemohon(r, df_keputusan)
+        st.caption(
+            f"Risiko gagal bayar (C5) lebih tinggi daripada {lebih_aman:.0%} "
+            "pemohon lain. Dibaca sebagai peringkat risiko relatif, bukan "
+            "peluang pasti."
+        )
 
         tampilkan_beban(r)
         tampilkan_verifikasi(r)
@@ -418,11 +464,11 @@ def tampilkan_hasil_terakhir(df_keputusan: pd.DataFrame | None) -> None:
 
 def tab_input(konteks_asal: dict, df_keputusan: pd.DataFrame | None) -> None:
     daftar = st.session_state.pemohon_baru
-    st.subheader("Input pemohon baru")
-    st.caption(
+    tampilan.bagian(
+        st, "Berkas pengajuan", "Input pemohon baru",
         "Isi data berkas pengajuan. Sistem menghitung C1–C6 dengan aturan dan "
         "model yang sama persis dengan pemohon lain, lalu memasukkannya ke "
-        "peringkat. Identitas cukup berupa kode, tanpa nama maupun NIK."
+        "peringkat. Identitas cukup berupa kode, tanpa nama maupun NIK.",
     )
 
     pesan_csv = st.session_state.pop("pesan_csv", None)
@@ -525,11 +571,10 @@ def tab_input(konteks_asal: dict, df_keputusan: pd.DataFrame | None) -> None:
             st.rerun()
 
     # ---- Daftar pemohon input ------------------------------------------
-    st.divider()
-    st.subheader(f"Daftar pemohon input ({len(daftar)})")
-    st.caption(
+    tampilan.bagian(
+        st, "Daftar", f"Pemohon input ({len(daftar)})",
         "Daftar ini hanya tersimpan selama halaman terbuka. Unduh CSV sebelum "
-        "menutup atau me-refresh halaman, lalu unggah kembali bila diperlukan."
+        "menutup atau me-refresh halaman, lalu unggah kembali bila diperlukan.",
     )
 
     if daftar:
@@ -595,7 +640,10 @@ def tab_bobot(hasil_ahp, bobot_pakai: np.ndarray) -> None:
     kiri, kanan = st.columns([1.1, 1])
 
     with kiri:
-        st.subheader("Matriks perbandingan berpasangan")
+        tampilan.bagian(
+            st, "Penilaian pengurus", "Matriks perbandingan berpasangan",
+            "Gabungan tiga responden dengan rata-rata geometrik.",
+        )
         st.dataframe(
             pd.DataFrame(
                 hasil_ahp.matriks,
@@ -615,7 +663,10 @@ def tab_bobot(hasil_ahp, bobot_pakai: np.ndarray) -> None:
         )
 
     with kanan:
-        st.subheader("Bobot: AHP vs pilihan pengguna")
+        tampilan.bagian(
+            st, "Bobot", "AHP dibanding bobot yang dipakai",
+            "Bobot dipakai mengikuti penggeser di sidebar.",
+        )
         banding = pd.DataFrame({
             "Kriteria": [f"{k} {cfg.CRITERIA_NAMES[k]}" for k in cfg.CRITERIA_CODES],
             "Bobot AHP": hasil_ahp.bobot,
@@ -629,14 +680,24 @@ def tab_bobot(hasil_ahp, bobot_pakai: np.ndarray) -> None:
                     format="%.4f", min_value=0.0, max_value=0.5),
             },
         )
-        st.bar_chart(banding.set_index("Kriteria")[["Bobot AHP", "Bobot dipakai"]])
+        st.bar_chart(
+            banding.set_index("Kriteria")[["Bobot AHP", "Bobot dipakai"]],
+            color=["#B8B1A2", tampilan.PALET[0]],
+        )
 
 
 # --------------------------------------------------------------------------
 # TAB: SENSITIVITAS
 # --------------------------------------------------------------------------
 def tab_sensitivitas(konteks: dict, par: dict) -> None:
-    st.subheader("Ketahanan peringkat terhadap perubahan bobot")
+    tampilan.bagian(
+        st, "Sensitivitas", "Ketahanan peringkat terhadap perubahan bobot",
+        "Bobot satu kriteria digeser, bobot lain disesuaikan, lalu "
+        "peringkat dihitung ulang.",
+        penjelasan="Sumbu tegak adalah peringkat; garis yang menukik ke bawah "
+                   "berarti peringkat memburuk. Garis yang saling berpotongan "
+                   "menandakan pembalikan peringkat (rank reversal).",
+    )
 
     kode = st.selectbox(
         "Kriteria yang divariasikan",
@@ -659,11 +720,9 @@ def tab_sensitivitas(konteks: dict, par: dict) -> None:
         sens[sens["id_pemohon"].isin(teratas)]
         .pivot(index="bobot", columns="id_pemohon", values="peringkat")
     )
-    st.line_chart(pivot, height=340)
-    st.caption(
-        "Sumbu tegak adalah peringkat; garis yang menukik ke bawah berarti "
-        "peringkat memburuk. Garis yang saling berpotongan menandakan "
-        "pembalikan peringkat (rank reversal)."
+    st.line_chart(
+        pivot, height=340,
+        color=tampilan.PALET[: len(pivot.columns)] or None,
     )
 
     kiri, kanan = st.columns(2)
@@ -692,11 +751,12 @@ def tab_whatif(konteks: dict, par: dict, df_keputusan: pd.DataFrame) -> None:
     kiri, kanan = st.columns(2)
 
     with kiri:
-        st.subheader("What-if")
-        st.caption(
+        tampilan.bagian(
+            st, "Simulasi", "What-if",
             "Ubah nilai satu kriteria pada satu pemohon, lalu lihat dampaknya "
-            "pada peringkat. Seluruh alternatif dihitung ulang karena TOPSIS "
-            "bersifat relatif terhadap solusi ideal."
+            "pada peringkat.",
+            penjelasan="Seluruh alternatif dihitung ulang karena TOPSIS "
+                       "bersifat relatif terhadap solusi ideal.",
         )
         id_target = st.selectbox(
             "Pemohon", konteks["id_alternatif"], key="wi_id",
@@ -734,10 +794,10 @@ def tab_whatif(konteks: dict, par: dict, df_keputusan: pd.DataFrame) -> None:
         c.metric("Alternatif lain bergeser", hasil["alternatif_lain_bergeser"])
 
     with kanan:
-        st.subheader("Goal seeking")
-        st.caption(
+        tampilan.bagian(
+            st, "Simulasi", "Goal seeking",
             "Tetapkan peringkat yang diinginkan, lalu sistem mencari nilai "
-            "kriteria minimum yang dibutuhkan untuk mencapainya."
+            "kriteria minimum yang dibutuhkan untuk mencapainya.",
         )
         id_gs = st.selectbox("Pemohon", konteks["id_alternatif"], key="gs_id")
         kode_gs = st.selectbox(
@@ -770,12 +830,13 @@ def tab_whatif(konteks: dict, par: dict, df_keputusan: pd.DataFrame) -> None:
 # TAB: VALIDASI
 # --------------------------------------------------------------------------
 def tab_validasi(konteks: dict, df_keputusan: pd.DataFrame, par: dict) -> None:
-    st.subheader("Perbandingan dengan kebijakan alternatif")
-    st.caption(
-        "Seluruh kebijakan diuji pada plafon dan batas PD yang sama persis. "
-        "Kebijakan yang unggul pada kedua kolom sekaligus adalah kebijakan "
-        "yang benar-benar lebih baik, bukan yang sekadar menukar satu tujuan "
-        "dengan tujuan lain."
+    tampilan.bagian(
+        st, "Validasi", "Perbandingan dengan kebijakan alternatif",
+        "Seluruh kebijakan diuji pada plafon dan batas PD yang sama persis.",
+        penjelasan="Kebijakan yang unggul pada kedua kolom sekaligus (tingkat "
+                   "macet dan IKS penerima) adalah kebijakan yang benar-benar "
+                   "lebih baik, bukan yang sekadar menukar satu tujuan dengan "
+                   "tujuan lain.",
     )
     # Perbandingan kebijakan menghitung tingkat macet sebenarnya, sehingga
     # hanya pemohon contoh yang berlabel yang dapat diikutkan.
@@ -798,8 +859,10 @@ def tab_validasi(konteks: dict, df_keputusan: pd.DataFrame, par: dict) -> None:
                 "angsurannya belum diketahui."
             )
 
-    st.divider()
-    st.subheader("Kinerja model prediktif")
+    tampilan.bagian(
+        st, "Model prediktif", "Kinerja pada data uji",
+        "Data uji dipakai satu kali, setelah model dan ambang dipilih.",
+    )
     hasil_model = konteks["hasil_model"]
     m = hasil_model.metrik_uji
 
@@ -827,10 +890,11 @@ def tab_validasi(konteks: dict, df_keputusan: pd.DataFrame, par: dict) -> None:
 # TAB: RIWAYAT
 # --------------------------------------------------------------------------
 def tab_riwayat(df_keputusan: pd.DataFrame, par: dict, hasil_ahp) -> None:
-    st.subheader("Riwayat skenario keputusan")
-    st.caption(
-        "Penyimpanan riwayat inilah yang memisahkan SPK dari kalkulator sekali "
-        "pakai: skenario, bobot, dan hasilnya dapat ditelusuri kembali."
+    tampilan.bagian(
+        st, "Riwayat", "Skenario keputusan tersimpan",
+        "Skenario, bobot, dan hasilnya dapat ditelusuri kembali.",
+        penjelasan="Penyimpanan riwayat inilah yang memisahkan SPK dari "
+                   "kalkulator sekali pakai.",
     )
 
     catatan = st.text_input("Catatan skenario", "Skenario uji dari antarmuka")
@@ -879,11 +943,7 @@ def tab_riwayat(df_keputusan: pd.DataFrame, par: dict, hasil_ahp) -> None:
 # UTAMA
 # --------------------------------------------------------------------------
 def main() -> None:
-    st.title("SPK Prioritisasi Penyaluran Kredit Mikro")
-    st.caption(
-        "Koperasi Simpan Pinjam Sejahtera Mandiri · hybrid data-driven dan "
-        "model-driven · AHP + TOPSIS di atas model prediksi gagal bayar"
-    )
+    tampilan.pasang_gaya(st)
 
     konteks = muat_pipeline()
     st.session_state.setdefault("pemohon_baru", [])
@@ -894,6 +954,25 @@ def main() -> None:
     # sidebar. Seluruh tab analisis membaca konteks ini.
     aktif = susun_konteks_aktif(konteks, par["sumber"])
     cukup = len(aktif["id_alternatif"]) >= 2
+
+    diajukan = float(aktif["df_periode"]["nilai_pengajuan_rp"].sum())
+    tampilan.kop(
+        st,
+        atas="Koperasi Simpan Pinjam Sejahtera Mandiri · Surakarta",
+        judul="Prioritas Penyaluran Kredit Mikro",
+        sub="Sistem pendukung keputusan: risiko gagal bayar dari model "
+            "prediktif, kebutuhan sosial dari kriteria BPS, bobot dari "
+            "penilaian pengurus (AHP), diperingkat dengan "
+            f"{par['metode']}.",
+        fakta=[
+            ("Plafon periode", rupiah(par["plafon"], singkat=True)),
+            ("Pemohon", str(len(aktif["id_alternatif"]))),
+            ("Total diajukan", rupiah(diajukan, singkat=True)),
+            ("Permintaan / plafon",
+             f"{diajukan / par['plafon']:.2f}x".replace(".", ",")),
+            ("CR AHP", f"{hasil_ahp.cr:.3f}".replace(".", ",")),
+        ],
+    )
 
     df_keputusan = None
     if cukup:
@@ -951,11 +1030,11 @@ def main() -> None:
         if butuh_pemohon():
             tab_riwayat(df_keputusan, par, hasil_ahp)
 
-    st.divider()
-    st.caption(
+    tampilan.kaki(
+        st,
         "Sistem ini bersifat decision support, bukan decision automation. "
         "Keputusan akhir tetap berada pada pengelola koperasi. "
-        "Sumber data: UCI Statlog German Credit (id=144), lisensi CC BY 4.0."
+        "Sumber data: UCI Statlog German Credit (id=144), lisensi CC BY 4.0.",
     )
 
 

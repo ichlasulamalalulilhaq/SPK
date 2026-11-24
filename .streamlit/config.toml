@@ -1,0 +1,13 @@
+# Tema antarmuka. Warna di sini dipakai komponen bawaan Streamlit (slider,
+# tombol, tautan, grafik), sedangkan detail tata letak ada di src/tampilan.py.
+# Palet: kertas krem, tinta gelap, satu aksen hijau tua.
+[theme]
+base = "light"
+primaryColor = "#1F5C4A"
+backgroundColor = "#F7F5F0"
+secondaryBackgroundColor = "#EDE9DF"
+textColor = "#1C1B19"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
