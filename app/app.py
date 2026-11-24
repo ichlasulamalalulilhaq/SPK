@@ -29,7 +29,11 @@ if str(AKAR) not in sys.path:
 
 from src import config as cfg                      # noqa: E402
 from src import evaluasi, knowledge, ml_model, pipeline, sensitivity  # noqa: E402
+from src import input_pemohon as inp               # noqa: E402
 from src.mcdm import ahp, ranking                  # noqa: E402
+
+SUMBER_GABUNG = "40 pemohon contoh + pemohon input"
+SUMBER_INPUT = "Hanya pemohon input"
 
 def rupiah(nilai: float, singkat: bool = False) -> str:
     """
@@ -64,6 +68,52 @@ def muat_pipeline() -> dict:
     return pipeline.jalankan(verbose=False)
 
 
+@st.cache_data(show_spinner="Menilai pemohon input...")
+def nilai_pemohon_input(isian: tuple, _konteks: dict) -> pd.DataFrame:
+    """
+    Hitung C1-C6 pemohon input, disimpan di cache per isi daftar.
+
+    Awalan garis bawah pada _konteks membuat Streamlit tidak mencoba
+    meng-hash objek scikit-learn di dalamnya.
+    """
+    return inp.nilai_pemohon([dict(d) for d in isian], _konteks)
+
+
+def susun_konteks_aktif(konteks: dict, sumber: str) -> dict:
+    """
+    Gabungkan kohort contoh dengan pemohon input menjadi matriks keputusan.
+
+    Seluruh tab membaca konteks hasil fungsi ini, sehingga pemohon input ikut
+    dipertimbangkan pada keputusan, sensitivitas, what-if, dan riwayat.
+    """
+    bagian = []
+    if sumber == SUMBER_GABUNG:
+        contoh = konteks["df_periode"].copy()
+        contoh["sumber"] = "Contoh"
+        contoh["perlu_verifikasi"] = False
+        bagian.append(contoh)
+
+    daftar = st.session_state.get("pemohon_baru", [])
+    if daftar:
+        isian = tuple(tuple(d.items()) for d in daftar)
+        bagian.append(nilai_pemohon_input(isian, konteks))
+
+    df = (pd.concat(bagian, ignore_index=True) if bagian
+          else konteks["df_periode"].iloc[0:0].copy())
+    if "perlu_verifikasi" not in df.columns:
+        df["perlu_verifikasi"] = False
+    df["perlu_verifikasi"] = df["perlu_verifikasi"].fillna(False).astype(bool)
+
+    matriks, _, benefit = pipeline.bentuk_matriks_keputusan(df)
+    return {
+        **konteks,
+        "df_periode": df,
+        "matriks": matriks,
+        "benefit": benefit,
+        "id_alternatif": df["id_pemohon"].tolist(),
+    }
+
+
 def hitung_ulang(konteks: dict, bobot: np.ndarray, metode: str) -> pd.DataFrame:
     """Hitung ulang peringkat dengan bobot pilihan pengguna."""
     matriks = konteks["matriks"]
@@ -83,6 +133,12 @@ def hitung_ulang(konteks: dict, bobot: np.ndarray, metode: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 def gambar_sidebar(bobot_ahp: np.ndarray) -> dict:
     st.sidebar.header("Parameter Keputusan")
+
+    n_input = len(st.session_state.get("pemohon_baru", []))
+    sumber = st.sidebar.radio(
+        "Pemohon yang diperingkat", [SUMBER_GABUNG, SUMBER_INPUT],
+        help=f"Pemohon input saat ini: {n_input}. Tambahkan lewat tab Input Pemohon.",
+    )
 
     # Batas DITURUNKAN dari konfigurasi, tidak ditulis tangan. Versi
     # sebelumnya memakai batas skala Deutsche Mark yang tertinggal saat
@@ -158,7 +214,7 @@ def gambar_sidebar(bobot_ahp: np.ndarray) -> dict:
              "sampai masa angsuran berjalan.",
     )
     return {"plafon": plafon, "pd_batas": pd_batas, "metode": metode,
-            "bobot": bobot, "mode_evaluasi": mode_evaluasi}
+            "bobot": bobot, "mode_evaluasi": mode_evaluasi, "sumber": sumber}
 
 
 # --------------------------------------------------------------------------
@@ -192,34 +248,39 @@ def tab_keputusan(df_keputusan: pd.DataFrame, par: dict) -> None:
     # nyata metrik ini MUSTAHIL ada sebelum masa angsuran berjalan, sehingga
     # menampilkannya tanpa keterangan membuat pengguna menyangka sistem dapat
     # memastikan hasil di muka.
-    if par.get("mode_evaluasi") and "target_macet" in df_keputusan.columns and len(disetujui):
+    # Pemohon input belum punya label macet, sehingga metrik evaluasi hanya
+    # dihitung dari pemohon contoh yang berlabel.
+    disetujui_label = disetujui[disetujui["target_macet"].notna()]
+    semua_label = df_keputusan[df_keputusan["target_macet"].notna()]
+    if par.get("mode_evaluasi") and len(disetujui_label):
         k5.metric(
             "Macet aktual  [EVALUASI]",
-            f"{disetujui['target_macet'].mean():.1%}",
-            f"{disetujui['target_macet'].mean() - df_keputusan['target_macet'].mean():+.1%}",
+            f"{disetujui_label['target_macet'].mean():.1%}",
+            f"{disetujui_label['target_macet'].mean() - semua_label['target_macet'].mean():+.1%}",
             delta_color="inverse",
             help="Hanya tersedia pada data uji berlabel. Pada penyaluran "
-                 "nyata angka ini belum ada saat keputusan diambil.",
+                 "nyata angka ini belum ada saat keputusan diambil. Pemohon "
+                 f"input tidak ikut dihitung ({len(disetujui) - len(disetujui_label)} "
+                 "penerima tanpa label).",
         )
     elif len(disetujui):
         k5.metric("Macet aktual", "—",
-                  help="Tidak tersedia di luar mode evaluasi.")
+                  help="Tidak tersedia di luar mode evaluasi atau tanpa pemohon berlabel.")
 
     st.divider()
 
-    saring = st.multiselect(
-        "Tampilkan status", ["DISETUJUI", "DITUNDA", "DITOLAK"],
-        default=["DISETUJUI", "DITUNDA", "DITOLAK"],
-    )
+    semua_status = ["DISETUJUI", "DITUNDA", "DITOLAK", "PERLU VERIFIKASI"]
+    saring = st.multiselect("Tampilkan status", semua_status, default=semua_status)
     tampil = df_keputusan[df_keputusan["status_keputusan"].isin(saring)]
 
     st.dataframe(
         tampil[[
-            "rank_TOPSIS", "id_pemohon", "skor", "iks_skor", "kapasitas_angsur",
+            "rank_TOPSIS", "id_pemohon", "sumber", "skor", "iks_skor", "kapasitas_angsur",
             "skor_riwayat", "skor_produktif", "pd_model", "nilai_pengajuan_rp",
             "status_keputusan", "alasan",
         ]].rename(columns={
-            "rank_TOPSIS": "Peringkat", "id_pemohon": "ID", "skor": "Skor",
+            "rank_TOPSIS": "Peringkat", "id_pemohon": "ID", "sumber": "Sumber",
+            "skor": "Skor",
             "iks_skor": "C1 IKS", "kapasitas_angsur": "C2 Kapasitas",
             "skor_riwayat": "C3 Riwayat", "skor_produktif": "C4 Produktif",
             "pd_model": "C5 PD", "nilai_pengajuan_rp": "C6 Nilai (Rp)",
@@ -236,18 +297,295 @@ def tab_keputusan(df_keputusan: pd.DataFrame, par: dict) -> None:
     )
 
     st.subheader("Rincian satu pemohon")
-    pilihan = st.selectbox("Pilih pemohon", tampil["id_pemohon"].tolist())
+    daftar_id = tampil.sort_values("rank_TOPSIS")["id_pemohon"].tolist()
+    if not daftar_id:
+        st.info("Tidak ada pemohon dengan status yang dipilih.")
+        return
+    terakhir = st.session_state.get("terakhir")
+    pilihan = st.selectbox(
+        "Pilih pemohon", daftar_id,
+        index=daftar_id.index(terakhir) if terakhir in daftar_id else 0,
+    )
     baris = df_keputusan[df_keputusan["id_pemohon"] == pilihan].iloc[0]
 
     kiri, kanan = st.columns([1, 1])
     with kiri:
         st.markdown(f"**Penjelasan peringkat**\n\n{baris['penjelasan']}")
         st.markdown(f"**Keputusan:** `{baris['status_keputusan']}` — {baris['alasan']}")
+        tampilkan_beban(baris)
+        if baris.get("sumber") == "Input":
+            tampilkan_verifikasi(baris)
     with kanan:
         st.markdown(f"**Indikator deprivasi yang terpenuhi (IKS {int(baris['iks_skor'])}/{cfg.IKS_MAX})**")
         alasan_iks = knowledge.jelaskan_iks(baris)
         st.markdown("\n".join(f"- {a}" for a in alasan_iks) if alasan_iks
                     else "- Tidak ada indikator deprivasi terpenuhi")
+
+
+def tampilkan_beban(baris: pd.Series) -> None:
+    """Angsuran, beban terhadap pendapatan, dan status kesejahteraan."""
+    if pd.isna(baris.get("angsuran_bulanan")):
+        return
+    perkiraan = " (perkiraan dari jenis pekerjaan)" if baris.get("sumber") != "Input" else ""
+    rasio = float(baris["rasio_angsuran_pendapatan"])
+    st.markdown(
+        f"**Angsuran:** {rupiah(baris['angsuran_bulanan'])}/bulan selama "
+        f"{int(baris['durasi_bulan'])} bulan · **{rasio:.1%}** dari pendapatan "
+        f"{rupiah(baris['pendapatan_rt_rp'])}{perkiraan} · "
+        f"**Kesejahteraan:** {baris['status_kesejahteraan']}"
+    )
+    if rasio > 0.30:
+        st.warning(
+            f"Beban angsuran {rasio:.1%} melampaui batas kehati-hatian 30% "
+            "pendapatan. Pertimbangkan tenor lebih panjang atau nilai lebih kecil."
+        )
+
+
+def tampilkan_verifikasi(baris: pd.Series) -> None:
+    """Jaminan dan hasil verifikasi lapangan pemohon input."""
+    st.markdown(
+        f"**Jaminan:** penjamin {str(baris['penjamin_label']).lower()}, "
+        f"aset {str(baris['kepemilikan_aset_label']).lower()}  \n"
+        f"**Survei lapangan:** {baris['sudah_survei']} · "
+        f"**Karakter:** {baris['karakter']}"
+    )
+    if baris.get("catatan_petugas"):
+        st.markdown(f"**Catatan petugas:** {baris['catatan_petugas']}")
+    if baris["karakter"] == "Kurang":
+        st.error(
+            "Penilaian karakter KURANG. Sistem tetap memeringkat berdasarkan "
+            "enam kriteria, tetapi petugas perlu mempertimbangkan ini sebelum "
+            "pencairan."
+        )
+    if baris["sudah_survei"] != "Sudah":
+        st.warning(
+            "Belum disurvei. Pemohon tidak memperoleh dana sampai data "
+            "diverifikasi ke lapangan."
+        )
+
+
+# --------------------------------------------------------------------------
+# TAB: INPUT PEMOHON
+# --------------------------------------------------------------------------
+def _kode_berikutnya(terpakai: set[str]) -> str:
+    n = 1
+    while f"BARU-{n:03d}" in terpakai:
+        n += 1
+    return f"BARU-{n:03d}"
+
+
+def _id_terpakai(konteks_asal: dict) -> set[str]:
+    return ({d["id_pemohon"] for d in st.session_state.pemohon_baru}
+            | set(konteks_asal["df_periode"]["id_pemohon"]))
+
+
+def tampilkan_hasil_terakhir(df_keputusan: pd.DataFrame | None) -> None:
+    """Kartu hasil penilaian pemohon yang terakhir ditambahkan."""
+    id_akhir = st.session_state.get("terakhir")
+    if df_keputusan is None or id_akhir not in set(df_keputusan["id_pemohon"]):
+        return
+    r = df_keputusan[df_keputusan["id_pemohon"] == id_akhir].iloc[0]
+    status = r["status_keputusan"]
+
+    with st.container(border=True):
+        st.markdown(f"#### Hasil penilaian {id_akhir}")
+        pesan = (f"Peringkat {int(r['rank_TOPSIS'])} dari {len(df_keputusan)} · "
+                 f"status **{status}** — {r['alasan']}")
+        {"DISETUJUI": st.success, "DITUNDA": st.info,
+         "DITOLAK": st.error}.get(status, st.warning)(pesan)
+
+        lebih_aman = (df_keputusan["pd_model"] < r["pd_model"]).mean()
+        a, b, c = st.columns(3)
+        a.metric("C1 Kebutuhan Sosial", f"{int(r['iks_skor'])}/{cfg.IKS_MAX}")
+        b.metric("C2 Kapasitas Angsur", f"{r['kapasitas_angsur']:.0f}/100")
+        c.metric("C3 Riwayat Kredit", f"{int(r['skor_riwayat'])}/4")
+        a, b, c = st.columns(3)
+        a.metric("C4 Dampak Produktif", f"{int(r['skor_produktif'])}/4")
+        b.metric("C5 Risiko Gagal Bayar", f"{r['pd_model']:.3f}",
+                 help=f"Lebih berisiko daripada {lebih_aman:.0%} pemohon lain. "
+                      "Dibaca sebagai peringkat risiko relatif, bukan peluang pasti.")
+        c.metric("C6 Nilai Pengajuan", rupiah(r["nilai_pengajuan_rp"], singkat=True))
+
+        tampilkan_beban(r)
+        tampilkan_verifikasi(r)
+        for p in st.session_state.get("peringatan_terakhir", []):
+            st.warning(p)
+        with st.expander("Indikator kebutuhan sosial yang terpenuhi"):
+            alasan = knowledge.jelaskan_iks(r)
+            st.markdown("\n".join(f"- {x}" for x in alasan) if alasan
+                        else "- Tidak ada indikator deprivasi terpenuhi")
+
+
+def tab_input(konteks_asal: dict, df_keputusan: pd.DataFrame | None) -> None:
+    daftar = st.session_state.pemohon_baru
+    st.subheader("Input pemohon baru")
+    st.caption(
+        "Isi data berkas pengajuan. Sistem menghitung C1–C6 dengan aturan dan "
+        "model yang sama persis dengan pemohon lain, lalu memasukkannya ke "
+        "peringkat. Identitas cukup berupa kode, tanpa nama maupun NIK."
+    )
+
+    pesan_csv = st.session_state.pop("pesan_csv", None)
+    if pesan_csv:
+        n_sah, galat_csv = pesan_csv
+        if n_sah:
+            st.success(f"{n_sah} pemohon dari CSV berhasil ditambahkan.")
+        if galat_csv:
+            st.error("Baris yang ditolak:\n\n" + "\n".join(f"- {g}" for g in galat_csv))
+
+    tampilkan_hasil_terakhir(df_keputusan)
+
+    kode = _kode_berikutnya(_id_terpakai(konteks_asal))
+    with st.form("form_pemohon"):
+        st.markdown(f"**Kode pemohon:** `{kode}` (otomatis)")
+
+        st.markdown("##### 1. Data diri dan rumah tangga")
+        a, b, c = st.columns(3)
+        usia = a.number_input("Usia (tahun)", inp.USIA_MIN, inp.USIA_MAKS, 35)
+        jenis_kelamin = b.selectbox("Jenis kelamin", inp.JENIS_KELAMIN)
+        status_nikah = c.selectbox("Status pernikahan", inp.STATUS_NIKAH, index=1)
+        a, b, c = st.columns(3)
+        anggota_rt = a.number_input("Jumlah anggota keluarga serumah", 1, 20, 4)
+        tanggungan = b.number_input(
+            "Jumlah tanggungan", 0, 20, 2,
+            help="Orang yang biaya hidupnya ditanggung pemohon.")
+        status_rumah = c.selectbox("Status rumah", list(inp.STATUS_RUMAH))
+        a, b = st.columns(2)
+        lama_domisili = a.selectbox(
+            "Lama tinggal di alamat ini", list(inp.LAMA_DOMISILI), index=3)
+        telepon = b.radio("Punya nomor HP aktif", list(inp.TELEPON), horizontal=True)
+
+        st.markdown("##### 2. Pekerjaan dan keuangan")
+        a, b, c = st.columns(3)
+        jenis_pekerjaan = a.selectbox("Jenis pekerjaan", list(inp.JENIS_PEKERJAAN), index=1)
+        lama_bekerja = b.selectbox("Lama bekerja", list(inp.LAMA_BEKERJA), index=2)
+        pendapatan = c.number_input(
+            "Pendapatan rumah tangga per bulan (Rp)", 0, 1_000_000_000,
+            2_500_000, step=100_000)
+        a, b = st.columns(2)
+        rekening = a.selectbox("Rekening bank", list(inp.REKENING))
+        tabungan = b.selectbox("Tabungan", list(inp.TABUNGAN))
+        a, b, c = st.columns(3)
+        cicilan_lain = a.selectbox("Cicilan di tempat lain", list(inp.CICILAN_LAIN))
+        pinjaman_aktif = b.number_input(
+            "Jumlah pinjaman berjalan (termasuk ini)", 1, 4, 1)
+        riwayat = c.selectbox("Riwayat pinjaman", list(inp.RIWAYAT), index=2)
+
+        st.markdown("##### 3. Pengajuan")
+        a, b, c = st.columns(3)
+        nilai_pinjaman = a.number_input(
+            "Nilai pinjaman (Rp)", 0, 1_000_000_000, 3_000_000, step=50_000)
+        tenor = b.number_input(
+            "Jangka waktu (bulan)", inp.TENOR_MIN, inp.TENOR_MAKS, 12)
+        tujuan = c.selectbox("Tujuan pinjaman", list(inp.TUJUAN))
+        st.caption(
+            "Angsuran per bulan dan beban terhadap pendapatan dihitung otomatis "
+            "(anuitas, bunga 18% per tahun) setelah tombol ditekan."
+        )
+
+        st.markdown("##### 4. Jaminan")
+        a, b = st.columns(2)
+        penjamin = a.selectbox("Penjamin", list(inp.PENJAMIN))
+        agunan = b.selectbox("Aset / agunan", list(inp.AGUNAN), index=3)
+
+        st.markdown("##### 5. Verifikasi lapangan")
+        a, b = st.columns(2)
+        sudah_survei = a.radio(
+            "Sudah disurvei ke lapangan?", inp.SUDAH_SURVEI, horizontal=True,
+            help="Pemohon yang belum disurvei berstatus PERLU VERIFIKASI dan "
+                 "tidak memperoleh dana.")
+        karakter = b.radio("Penilaian karakter", inp.KARAKTER, horizontal=True)
+        catatan = st.text_area("Catatan petugas (opsional)", "")
+
+        kirim = st.form_submit_button(
+            "Nilai pemohon", type="primary", use_container_width=True)
+
+    if kirim:
+        data = {
+            "id_pemohon": kode, "usia": usia, "jenis_kelamin": jenis_kelamin,
+            "status_nikah": status_nikah, "anggota_rt": anggota_rt,
+            "tanggungan": tanggungan, "status_rumah": status_rumah,
+            "lama_domisili": lama_domisili, "telepon": telepon,
+            "jenis_pekerjaan": jenis_pekerjaan, "lama_bekerja": lama_bekerja,
+            "pendapatan_rp": pendapatan, "rekening": rekening,
+            "tabungan": tabungan, "cicilan_lain": cicilan_lain,
+            "pinjaman_aktif": pinjaman_aktif, "riwayat": riwayat,
+            "nilai_pinjaman_rp": nilai_pinjaman, "tenor_bulan": tenor,
+            "tujuan": tujuan, "penjamin": penjamin, "agunan": agunan,
+            "sudah_survei": sudah_survei, "karakter": karakter,
+            "catatan": catatan,
+        }
+        galat = inp.validasi(data)
+        if galat:
+            st.error("Data belum bisa dinilai:\n\n" + "\n".join(f"- {g}" for g in galat))
+        else:
+            daftar.append(inp.rapikan(data))
+            st.session_state.terakhir = kode
+            st.session_state.peringatan_terakhir = inp.peringatan(data)
+            st.rerun()
+
+    # ---- Daftar pemohon input ------------------------------------------
+    st.divider()
+    st.subheader(f"Daftar pemohon input ({len(daftar)})")
+    st.caption(
+        "Daftar ini hanya tersimpan selama halaman terbuka. Unduh CSV sebelum "
+        "menutup atau me-refresh halaman, lalu unggah kembali bila diperlukan."
+    )
+
+    if daftar:
+        tabel = pd.DataFrame(daftar, columns=inp.KOLOM_INPUT)
+        if df_keputusan is not None:
+            tabel = tabel.merge(
+                df_keputusan[["id_pemohon", "rank_TOPSIS", "status_keputusan"]],
+                on="id_pemohon", how="left",
+            ).rename(columns={"rank_TOPSIS": "peringkat", "status_keputusan": "status"})
+        st.dataframe(tabel, use_container_width=True, hide_index=True)
+
+        a, b = st.columns(2)
+        with a:
+            hapus = st.multiselect(
+                "Pilih pemohon yang akan dihapus", [d["id_pemohon"] for d in daftar])
+            if st.button("Hapus terpilih", disabled=not hapus):
+                st.session_state.pemohon_baru = [
+                    d for d in daftar if d["id_pemohon"] not in hapus]
+                st.rerun()
+        with b:
+            st.download_button(
+                "Unduh daftar pemohon input (CSV)",
+                pd.DataFrame(daftar, columns=inp.KOLOM_INPUT)
+                .to_csv(index=False).encode("utf-8"),
+                file_name=f"pemohon_input_{datetime.now():%Y%m%d_%H%M}.csv",
+                mime="text/csv", use_container_width=True,
+            )
+            yakin = st.checkbox("Saya yakin menghapus semua pemohon input")
+            if st.button("Hapus semua", disabled=not yakin):
+                st.session_state.pemohon_baru = []
+                st.session_state.pop("terakhir", None)
+                st.rerun()
+
+    # ---- Unggah CSV ----------------------------------------------------
+    with st.expander("Tambah banyak pemohon sekaligus dari CSV"):
+        st.markdown(
+            "1. Unduh templat, 2. isi satu baris per pemohon (bisa di Excel), "
+            "3. unggah kembali. Isian pilihan harus persis sama dengan daftar "
+            "di bawah. Kolom `id_pemohon` boleh dikosongkan."
+        )
+        st.download_button(
+            "Unduh templat CSV", inp.templat_csv(),
+            file_name="templat_pemohon.csv", mime="text/csv",
+        )
+        st.dataframe(inp.petunjuk_pilihan(), use_container_width=True, hide_index=True)
+        berkas = st.file_uploader("Unggah CSV pemohon", type="csv")
+        if berkas is not None and st.button("Tambahkan dari CSV", type="primary"):
+            sah, galat_csv = inp.baca_csv(berkas)
+            terpakai = _id_terpakai(konteks_asal)
+            for d in sah:
+                if not d["id_pemohon"] or d["id_pemohon"] in terpakai:
+                    d["id_pemohon"] = _kode_berikutnya(terpakai)
+                terpakai.add(d["id_pemohon"])
+                st.session_state.pemohon_baru.append(d)
+            st.session_state.pesan_csv = (len(sah), galat_csv)
+            st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -372,9 +710,14 @@ def tab_whatif(konteks: dict, par: dict, df_keputusan: pd.DataFrame) -> None:
         nilai_kini = float(konteks["matriks"][idx_alt, idx_krit])
 
         kolom = konteks["matriks"][:, idx_krit]
+        bawah, atas = float(kolom.min()), float(kolom.max())
+        # Slider Streamlit gagal bila batas bawah sama dengan batas atas, yang
+        # bisa terjadi bila hanya sedikit pemohon input dengan nilai kembar.
+        if atas <= bawah:
+            atas = bawah + max(abs(bawah), 1.0)
         nilai_baru = st.slider(
             f"Nilai baru {kode} (sekarang {nilai_kini:.4f})",
-            float(kolom.min()), float(kolom.max()), nilai_kini,
+            bawah, atas, nilai_kini,
             key="wi_nilai",
         )
 
@@ -434,10 +777,26 @@ def tab_validasi(konteks: dict, df_keputusan: pd.DataFrame, par: dict) -> None:
         "yang benar-benar lebih baik, bukan yang sekadar menukar satu tujuan "
         "dengan tujuan lain."
     )
-    tabel = evaluasi.bandingkan_kebijakan(
-        df_keputusan, plafon=par["plafon"], pd_batas=par["pd_batas"],
-    )
-    st.dataframe(tabel, use_container_width=True)
+    # Perbandingan kebijakan menghitung tingkat macet sebenarnya, sehingga
+    # hanya pemohon contoh yang berlabel yang dapat diikutkan.
+    df_label = df_keputusan[df_keputusan["target_macet"].notna()]
+    n_tanpa_label = len(df_keputusan) - len(df_label)
+    if len(df_label) < 2:
+        st.info(
+            "Perbandingan kebijakan membutuhkan pemohon contoh yang sudah "
+            "diketahui lancar atau macet. Pilih sumber pemohon "
+            f"'{SUMBER_GABUNG}' pada sidebar."
+        )
+    else:
+        tabel = evaluasi.bandingkan_kebijakan(
+            df_label, plafon=par["plafon"], pd_batas=par["pd_batas"],
+        )
+        st.dataframe(tabel, use_container_width=True)
+        if n_tanpa_label:
+            st.caption(
+                f"{n_tanpa_label} pemohon input tidak diikutkan karena hasil "
+                "angsurannya belum diketahui."
+            )
 
     st.divider()
     st.subheader("Kinerja model prediktif")
@@ -527,24 +886,32 @@ def main() -> None:
     )
 
     konteks = muat_pipeline()
+    st.session_state.setdefault("pemohon_baru", [])
     hasil_ahp = konteks["hasil_ahp"]
     par = gambar_sidebar(hasil_ahp.bobot)
 
-    df_rank = hitung_ulang(konteks, par["bobot"], par["metode"])
-    df_keputusan = pipeline.alokasikan_plafon(
-        df_rank, plafon=par["plafon"], pd_batas=par["pd_batas"],
-    )
+    # Konteks aktif = kohort contoh dan/atau pemohon input, sesuai pilihan
+    # sidebar. Seluruh tab analisis membaca konteks ini.
+    aktif = susun_konteks_aktif(konteks, par["sumber"])
+    cukup = len(aktif["id_alternatif"]) >= 2
 
-    # Penjelasan peringkat dihitung ulang karena bobot pengguna mengubah
-    # kontribusi tiap kriteria terhadap skor akhir.
-    hasil_topsis = ranking.topsis(konteks["matriks"], par["bobot"], konteks["benefit"])
-    peta_idx = {pid: i for i, pid in enumerate(konteks["id_alternatif"])}
-    df_keputusan["total_alternatif"] = len(df_keputusan)
-    df_keputusan["penjelasan"] = [
-        pipeline.jelaskan_peringkat(
-            r, hasil_topsis["matriks_terbobot"], peta_idx[r["id_pemohon"]])
-        for _, r in df_keputusan.iterrows()
-    ]
+    df_keputusan = None
+    if cukup:
+        df_rank = hitung_ulang(aktif, par["bobot"], par["metode"])
+        df_keputusan = pipeline.alokasikan_plafon(
+            df_rank, plafon=par["plafon"], pd_batas=par["pd_batas"],
+        )
+
+        # Penjelasan peringkat dihitung ulang karena bobot pengguna mengubah
+        # kontribusi tiap kriteria terhadap skor akhir.
+        hasil_topsis = ranking.topsis(aktif["matriks"], par["bobot"], aktif["benefit"])
+        peta_idx = {pid: i for i, pid in enumerate(aktif["id_alternatif"])}
+        df_keputusan["total_alternatif"] = len(df_keputusan)
+        df_keputusan["penjelasan"] = [
+            pipeline.jelaskan_peringkat(
+                r, hasil_topsis["matriks_terbobot"], peta_idx[r["id_pemohon"]])
+            for _, r in df_keputusan.iterrows()
+        ]
 
     if not hasil_ahp.konsisten:
         st.error(
@@ -552,22 +919,37 @@ def main() -> None:
             "Hasil pemeringkatan tidak layak dipakai."
         )
 
+    def butuh_pemohon() -> bool:
+        if not cukup:
+            st.info(
+                "Pemeringkatan membutuhkan minimal 2 pemohon. Tambahkan pemohon "
+                f"di tab Input Pemohon, atau pilih '{SUMBER_GABUNG}' pada sidebar."
+            )
+        return cukup
+
     tabs = st.tabs([
-        "Keputusan", "Bobot & AHP", "Sensitivitas",
+        "Keputusan", "Input Pemohon", "Bobot & AHP", "Sensitivitas",
         "What-if & Goal Seeking", "Validasi", "Riwayat",
     ])
     with tabs[0]:
-        tab_keputusan(df_keputusan, par)
+        if butuh_pemohon():
+            tab_keputusan(df_keputusan, par)
     with tabs[1]:
-        tab_bobot(hasil_ahp, par["bobot"])
+        tab_input(konteks, df_keputusan)
     with tabs[2]:
-        tab_sensitivitas(konteks, par)
+        tab_bobot(hasil_ahp, par["bobot"])
     with tabs[3]:
-        tab_whatif(konteks, par, df_keputusan)
+        if butuh_pemohon():
+            tab_sensitivitas(aktif, par)
     with tabs[4]:
-        tab_validasi(konteks, df_keputusan, par)
+        if butuh_pemohon():
+            tab_whatif(aktif, par, df_keputusan)
     with tabs[5]:
-        tab_riwayat(df_keputusan, par, hasil_ahp)
+        if butuh_pemohon():
+            tab_validasi(aktif, df_keputusan, par)
+    with tabs[6]:
+        if butuh_pemohon():
+            tab_riwayat(df_keputusan, par, hasil_ahp)
 
     st.divider()
     st.caption(

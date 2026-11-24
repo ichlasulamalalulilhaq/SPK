@@ -67,6 +67,12 @@ def alokasikan_plafon(
     2. Alokasi berurutan. Plafon diberikan menurut peringkat sampai dana habis.
        Pemohon yang nilainya melebihi sisa dana DILEWATI, bukan menghentikan
        alokasi, sehingga sisa dana tetap terpakai oleh peringkat di bawahnya.
+
+    3. Verifikasi lapangan. Pemohon input yang belum disurvei (kolom
+       `perlu_verifikasi`) tidak memperoleh dana sampai datanya diperiksa.
+       Aturan ini menjawab masukan responden wawancara yang menyesali
+       penyaluran berdasarkan keterangan pemohon yang tidak sesuai fakta.
+       Kohort dari dataset tidak memiliki kolom ini dan tidak terpengaruh.
     """
     df = df_peringkat.sort_values("rank_TOPSIS").copy()
 
@@ -80,6 +86,12 @@ def alokasikan_plafon(
             status.append("DITOLAK")
             nominal.append(0.0)
             alasan.append(f"PD {baris['pd_model']:.3f} melampaui batas {pd_batas}")
+        # Dibandingkan dengan ==, bukan `is`: nilai dari DataFrame bertipe
+        # numpy.bool_, dan NaN pada baris kohort harus terbaca tidak.
+        elif baris.get("perlu_verifikasi", False) in (True, 1):
+            status.append("PERLU VERIFIKASI")
+            nominal.append(0.0)
+            alasan.append("Data belum disurvei lapangan; diproses setelah diverifikasi")
         elif diminta <= sisa:
             status.append("DISETUJUI")
             nominal.append(diminta)
